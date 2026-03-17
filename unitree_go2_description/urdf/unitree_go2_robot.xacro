@@ -1,9 +1,26 @@
 <?xml version="1.0"?>
 
-<robot name="go2"
+<robot name="$(arg robot_name)"
     xmlns:xacro="http://www.ros.org/wiki/xacro">
 
     <xacro:arg name="DEBUG" default="false"/>
+
+    <!-- Used for multi-robot launches. -->
+    <xacro:arg name="robot_name" default="go2"/>
+    <xacro:arg name="robot_namespace" default=""/>
+    <!-- Path to ros2_control controller configuration. Launch should override with an absolute path. -->
+    <xacro:arg name="ros2_control_params" default="$(find unitree_go2_sim)/config/ros_control/ros_control.yaml"/>
+
+    <!--
+      Xacro <arg> does not automatically create a python variable.
+      We must explicitly copy the arg value into a property before using it
+      inside ${...} expressions.
+    -->
+    <xacro:property name="robot_namespace" value="$(arg robot_namespace)"/>
+    <xacro:property name="robot_name" value="$(arg robot_name)"/>
+
+    <!-- Convenience prefix for Gazebo Sim and ROS topic names. -->
+    <xacro:property name="ns_prefix" value="${'/' + robot_namespace if robot_namespace else ''}"/>
 
     <xacro:include filename="$(find unitree_go2_description)/urdf/const.xacro"/>
     <xacro:include filename="$(find unitree_go2_description)/urdf/materials.xacro"/>
