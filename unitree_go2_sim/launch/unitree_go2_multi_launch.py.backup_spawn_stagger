@@ -465,9 +465,7 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
             ]
         )
 
-        # Stagger complete per-robot startup to avoid Gazebo/ros2_control
-        # robot_description races when several Go2 models are spawned together.
-        actions.append(TimerAction(period=float(i) * 8.0, actions=[robot_group]))
+        actions.append(robot_group)
 
     return actions
 
