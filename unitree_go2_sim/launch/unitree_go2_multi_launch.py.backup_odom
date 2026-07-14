@@ -142,7 +142,7 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
                 f"/{ns}/imu/data@sensor_msgs/msg/Imu@gz.msgs.IMU",
                 f"/{ns}/velodyne_points/points@sensor_msgs/msg/PointCloud2@gz.msgs.PointCloudPacked",
                 f"/{ns}/unitree_lidar/points@sensor_msgs/msg/PointCloud2@gz.msgs.PointCloudPacked",
-                f"/{ns}/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry",
+                f"/{ns}/odom@nav_msgs/msg/Odometry@gz.msgs.Odometry",
                 f"/{ns}/rgb_image@sensor_msgs/msg/Image@gz.msgs.Image",
                 # Optional joint state bridge (kept for parity with the original launch)
                 f"/{ns}/joint_states@sensor_msgs/msg/JointState@gz.msgs.Model",
