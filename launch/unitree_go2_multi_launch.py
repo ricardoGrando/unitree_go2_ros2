@@ -1,4 +1,6 @@
 import os
+import subprocess
+import tempfile
 from typing import List
 
 import launch_ros
@@ -16,6 +18,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import Command, LaunchConfiguration
 from launch_ros.actions import Node, PushRosNamespace
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def _float_arg(context, name: str, default: float = 0.0) -> float:
@@ -78,21 +81,38 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
         x = x0 + col * x_spacing
         y = y0 + row * y_spacing
 
-        # Namespaced URDF. The xacros use robot_namespace to prefix Gazebo topics
-        # and to namespace gz_ros2_control.
+        # Generate one namespace-specific URDF before starting the robot processes.
+        # The same XML is used by robot_state_publisher / CHAMP and written to a
+        # temporary file for Gazebo spawning.  This removes robot_description DDS
+        # discovery from the critical spawn path.
+        description_file = description_path.perform(context)
+        xacro_cmd = [
+            "xacro",
+            description_file,
+            f"robot_name:={robot_name}",
+            f"robot_namespace:={ns}",
+            f"ros2_control_params:={ros_control_yaml}",
+        ]
+        try:
+            robot_xml = subprocess.run(
+                xacro_cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(
+                f"Failed to generate URDF for {robot_name}: {exc.stderr}"
+            ) from exc
+
+        fd, spawn_urdf_path = tempfile.mkstemp(
+            prefix=f"{robot_name}_", suffix="_spawn.urdf"
+        )
+        with os.fdopen(fd, "w") as f:
+            f.write(robot_xml)
+
         robot_description = {
-            "robot_description": Command(
-                [
-                    "xacro ",
-                    description_path,
-                    " robot_name:=",
-                    robot_name,
-                    " robot_namespace:=",
-                    ns,
-                    " ros2_control_params:=",
-                    ros_control_yaml,
-                ]
-            )
+            "robot_description": ParameterValue(robot_xml, value_type=str)
         }
 
         # Robot State Publisher
@@ -108,7 +128,8 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
             ],
         )
 
-        # Gazebo spawn (create). Kept inside namespace so it listens on <ns>/robot_description.
+        # Gazebo spawn (create). Read from the generated URDF file instead of
+        # subscribing to <ns>/robot_description.
         gazebo_spawn_robot = Node(
             package="ros_gz_sim",
             executable="create",
@@ -117,8 +138,8 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
             arguments=[
                 "-name",
                 robot_name,
-                "-topic",
-                "robot_description",
+                "-file",
+                spawn_urdf_path,
                 "-x",
                 str(x),
                 "-y",
@@ -165,20 +186,7 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
                 {"publish_joint_control": True},
                 {"publish_foot_contacts": False},
                 {"joint_controller_topic": "joint_group_effort_controller/joint_trajectory"},
-                {
-                    "urdf": Command(
-                        [
-                            "xacro ",
-                            description_path,
-                            " robot_name:=",
-                            robot_name,
-                            " robot_namespace:=",
-                            ns,
-                            " ros2_control_params:=",
-                            ros_control_yaml,
-                        ]
-                    )
-                },
+                {"urdf": ParameterValue(robot_xml, value_type=str)},
                 joints_config,
                 links_config,
                 gait_config,
@@ -196,20 +204,7 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
             parameters=[
                 {"use_sim_time": use_sim_time},
                 {"orientation_from_imu": True},
-                {
-                    "urdf": Command(
-                        [
-                            "xacro ",
-                            description_path,
-                            " robot_name:=",
-                            robot_name,
-                            " robot_namespace:=",
-                            ns,
-                            " ros2_control_params:=",
-                            ros_control_yaml,
-                        ]
-                    )
-                },
+                {"urdf": ParameterValue(robot_xml, value_type=str)},
                 joints_config,
                 links_config,
                 gait_config,
@@ -366,7 +361,7 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
         # To make the multi-robot launch robust, we explicitly set these parameters once the
         # controller manager service is available, then we spawn the controllers.
         set_controller_manager_params = TimerAction(
-            period=18.0 + float(i) * 2.0,
+            period=18.0 + float(i) * 4.0,
             actions=[
                 ExecuteProcess(
                     cmd=[
@@ -389,7 +384,7 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
 
         # Controller spawners per robot (use explicit controller manager namespace)
         controller_spawner_js = TimerAction(
-            period=22.0 + float(i) * 2.0,
+            period=22.0 + float(i) * 4.0,
             actions=[
                 Node(
                     package="controller_manager",
@@ -411,7 +406,7 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
         )
 
         controller_spawner_effort = TimerAction(
-            period=32.0 + float(i) * 2.0,
+            period=32.0 + float(i) * 4.0,
             actions=[
                 Node(
                     package="controller_manager",
@@ -433,7 +428,7 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
         )
 
         controller_status_check = TimerAction(
-            period=25.0 + float(i) * 2.0,
+            period=40.0 + float(i) * 4.0,
             actions=[
                 ExecuteProcess(
                     cmd=[
@@ -465,8 +460,8 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
             ]
         )
 
-        # Stagger complete per-robot startup to avoid Gazebo/ros2_control
-        # robot_description races when several Go2 models are spawned together.
+        # Stagger complete per-robot startup to reduce Gazebo / ros2_control load.
+        # Spawning itself no longer depends on robot_description DDS discovery.
         actions.append(TimerAction(period=float(i) * 8.0, actions=[robot_group]))
 
     return actions
