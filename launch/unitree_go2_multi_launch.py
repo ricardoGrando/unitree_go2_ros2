@@ -56,6 +56,16 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
     if robots_per_row <= 0:
         robots_per_row = num_robots
 
+    # Multi-robot startup synchronization. Gazebo Sim and gz_ros2_control can
+    # take several wall-clock seconds to expose their services, especially on
+    # the first robot.  Starting robot 0 immediately at launch was a race: a
+    # later robot could initialize while robot 0 never obtained a controller
+    # manager.  These delays are intentionally wall-clock based and only affect
+    # startup, not experimental simulation time.
+    spawn_start_delay_s = max(0.0, _float_arg(context, "robot_spawn_start_delay_s", 6.0))
+    robot_start_stagger_s = max(0.0, _float_arg(context, "robot_start_stagger_s", 12.0))
+    controller_bootstrap_delay_s = max(0.0, _float_arg(context, "controller_bootstrap_delay_s", 14.0))
+
     unitree_go2_sim_share = get_package_share_directory("unitree_go2_sim")
 
     # Controller definitions (types, joints, gains).
@@ -351,91 +361,46 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
             remappings=[("/tf", "tf"), ("/tf_static", "tf_static")],
         )
 
-        # Controller bootstrapping per robot
+        # Controller bootstrapping per robot.
         #
-        # In Jazzy, `spawner` expects <controller_name>.type to already exist as a parameter
-        # on the target controller_manager. If the controller manager did not load the
-        # controller YAML at startup, the spawner fails with:
-        #   The 'type' param was not defined for '<controller>'
-        #
-        # To make the multi-robot launch robust, we explicitly set these parameters once the
-        # controller manager service is available, then we spawn the controllers.
-        set_controller_manager_params = TimerAction(
-            period=18.0 + float(i) * 4.0,
+        # Earlier revisions started independent controller spawners on fixed
+        # timers.  With two or more robots those processes could overlap and
+        # contend for the controller-manager spawner lock; they could also run
+        # before the gz_ros2_control controller manager existed.  Bootstrap is
+        # now service-driven and serialized across robots with flock.
+        cm = f"/{ns}/controller_manager"
+        controller_bootstrap_cmd = (
+            'set -euo pipefail; '
+            f"CM='{cm}'; NS='{ns}'; PARAM_FILE='{ros_control_yaml}'; "
+            'echo "[$NS] waiting for $CM/list_controllers ..."; '
+            'ready=0; '
+            'for k in $(seq 1 1800); do '
+            '  if ros2 service list 2>/dev/null | grep -qx "$CM/list_controllers"; then ready=1; break; fi; '
+            '  sleep 0.1; '
+            'done; '
+            'if [ "$ready" -ne 1 ]; then '
+            '  echo "[$NS] ERROR: controller manager service never appeared: $CM/list_controllers" >&2; exit 21; '
+            'fi; '
+            'echo "[$NS] controller manager is available"; '
+            'exec 9>/tmp/unitree_go2_controller_bootstrap.lock; '
+            'if ! flock -w 180 9; then echo "[$NS] ERROR: controller bootstrap lock timeout" >&2; exit 22; fi; '
+            'echo "[$NS] acquired controller bootstrap lock"; '
+            'ros2 param set "$CM" joint_states_controller.type joint_state_broadcaster/JointStateBroadcaster; '
+            'ros2 param set "$CM" joint_group_effort_controller.type joint_trajectory_controller/JointTrajectoryController; '
+            'ros2 run controller_manager spawner joint_states_controller '
+            '  --controller-manager "$CM" --controller-manager-timeout 120 --param-file "$PARAM_FILE"; '
+            'ros2 run controller_manager spawner joint_group_effort_controller '
+            '  --controller-manager "$CM" --controller-manager-timeout 120 --param-file "$PARAM_FILE"; '
+            'echo "[$NS] controller status after bootstrap:"; '
+            'ros2 control list_controllers -c "$CM"; '
+            'echo "[$NS] controller bootstrap complete"'
+        )
+
+        controller_bootstrap = TimerAction(
+            period=controller_bootstrap_delay_s,
             actions=[
                 ExecuteProcess(
-                    cmd=[
-                        "bash",
-                        "-lc",
-                        (
-                            "set -e; "
-                            f"echo '[{ns}] setting controller types on /{ns}/controller_manager ...'; "
-                            "for k in $(seq 1 200); do "
-                            f"  ros2 service list 2>/dev/null | grep -q \"/{ns}/controller_manager/list_controllers\" && break; "
-                            "  sleep 0.1; "
-                            "done; "
-                            f"ros2 param set /{ns}/controller_manager joint_states_controller.type joint_state_broadcaster/JointStateBroadcaster; "
-                            f"ros2 param set /{ns}/controller_manager joint_group_effort_controller.type joint_trajectory_controller/JointTrajectoryController; "),
-                    ],
-                    output="screen",
-                )
-            ],
-        )
-
-        # Controller spawners per robot (use explicit controller manager namespace)
-        controller_spawner_js = TimerAction(
-            period=22.0 + float(i) * 4.0,
-            actions=[
-                Node(
-                    package="controller_manager",
-                    executable="spawner",
-                    name="spawner_joint_states_controller",
-                    output="screen",
-                    arguments=[
-                        "--controller-manager-timeout",
-                        "120",
-                        "--controller-manager",
-                        f"/{ns}/controller_manager",
-                        "--param-file",
-                        ros_control_yaml,
-                        "joint_states_controller",
-                    ],
-                    parameters=[{"use_sim_time": use_sim_time}],
-                )
-            ],
-        )
-
-        controller_spawner_effort = TimerAction(
-            period=32.0 + float(i) * 4.0,
-            actions=[
-                Node(
-                    package="controller_manager",
-                    executable="spawner",
-                    name="spawner_joint_group_effort_controller",
-                    output="screen",
-                    arguments=[
-                        "--controller-manager-timeout",
-                        "120",
-                        "--controller-manager",
-                        f"/{ns}/controller_manager",
-                        "--param-file",
-                        ros_control_yaml,
-                        "joint_group_effort_controller",
-                    ],
-                    parameters=[{"use_sim_time": use_sim_time}],
-                )
-            ],
-        )
-
-        controller_status_check = TimerAction(
-            period=40.0 + float(i) * 4.0,
-            actions=[
-                ExecuteProcess(
-                    cmd=[
-                        "bash",
-                        "-c",
-                        f"echo '[{ns}] controller status:' && ros2 control list_controllers -c /{ns}/controller_manager",
-                    ],
+                    cmd=["bash", "-lc", controller_bootstrap_cmd],
                     output="screen",
                 )
             ],
@@ -453,16 +418,15 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
                 footprint_to_odom_ekf,
                 map_to_odom_tf_node,
                 base_footprint_to_base_link_tf_node,
-                set_controller_manager_params,
-                controller_spawner_js,
-                controller_spawner_effort,
-                controller_status_check,
+                controller_bootstrap,
             ]
         )
 
-        # Stagger complete per-robot startup to reduce Gazebo / ros2_control load.
-        # Spawning itself no longer depends on robot_description DDS discovery.
-        actions.append(TimerAction(period=float(i) * 8.0, actions=[robot_group]))
+        # Give Gazebo time to initialize the world before robot 0, then start
+        # complete robot groups sequentially. This avoids the first-entity race
+        # observed in finite OGR-PM validation runs.
+        robot_start_delay = spawn_start_delay_s + float(i) * robot_start_stagger_s
+        actions.append(TimerAction(period=robot_start_delay, actions=[robot_group]))
 
     return actions
 
@@ -520,6 +484,24 @@ def generate_launch_description() -> LaunchDescription:
         "robots_per_row",
         default_value="0",
         description="Robots per row in the spawn grid. 0 means a single row.",
+    )
+
+    declare_robot_spawn_start_delay = DeclareLaunchArgument(
+        "robot_spawn_start_delay_s",
+        default_value="6.0",
+        description="Wall-clock delay before spawning robot 0 so Gazebo world services are ready.",
+    )
+
+    declare_robot_start_stagger = DeclareLaunchArgument(
+        "robot_start_stagger_s",
+        default_value="12.0",
+        description="Wall-clock stagger between complete per-robot startup groups.",
+    )
+
+    declare_controller_bootstrap_delay = DeclareLaunchArgument(
+        "controller_bootstrap_delay_s",
+        default_value="14.0",
+        description="Delay after each robot group starts before service-driven controller bootstrap.",
     )
 
     declare_world_init_x = DeclareLaunchArgument("world_init_x", default_value="0.0")
@@ -598,6 +580,9 @@ def generate_launch_description() -> LaunchDescription:
             declare_x_spacing,
             declare_y_spacing,
             declare_robots_per_row,
+            declare_robot_spawn_start_delay,
+            declare_robot_start_stagger,
+            declare_controller_bootstrap_delay,
             declare_world_init_x,
             declare_world_init_y,
             declare_world_init_z,
