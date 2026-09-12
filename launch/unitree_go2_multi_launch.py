@@ -64,7 +64,10 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
     # startup, not experimental simulation time.
     spawn_start_delay_s = max(0.0, _float_arg(context, "robot_spawn_start_delay_s", 6.0))
     robot_start_stagger_s = max(0.0, _float_arg(context, "robot_start_stagger_s", 12.0))
-    controller_bootstrap_delay_s = max(0.0, _float_arg(context, "controller_bootstrap_delay_s", 14.0))
+    controller_bootstrap_delay_s = max(0.0, _float_arg(context, "controller_bootstrap_delay_s", 0.0))
+    # v1.4: do not leave a dynamic quadruped uncontrolled for a fixed 14 s.
+    # The bootstrap process already waits for /controller_manager/list_controllers,
+    # so starting the waiter immediately is both safer and still race tolerant.
 
     unitree_go2_sim_share = get_package_share_directory("unitree_go2_sim")
 
@@ -521,8 +524,8 @@ def generate_launch_description() -> LaunchDescription:
 
     declare_controller_bootstrap_delay = DeclareLaunchArgument(
         "controller_bootstrap_delay_s",
-        default_value="14.0",
-        description="Delay after each robot group starts before service-driven controller bootstrap.",
+        default_value="0.0",
+        description="Start service-driven controller bootstrap immediately; it waits for the controller-manager service itself.",
     )
 
     declare_world_init_x = DeclareLaunchArgument("world_init_x", default_value="0.0")
