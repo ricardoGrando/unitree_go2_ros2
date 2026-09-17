@@ -1,6 +1,8 @@
+import math
 import os
 import subprocess
 import tempfile
+import xml.etree.ElementTree as ET
 from typing import List
 
 import launch_ros
@@ -65,9 +67,26 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
     spawn_start_delay_s = max(0.0, _float_arg(context, "robot_spawn_start_delay_s", 6.0))
     robot_start_stagger_s = max(0.0, _float_arg(context, "robot_start_stagger_s", 12.0))
     controller_bootstrap_delay_s = max(0.0, _float_arg(context, "controller_bootstrap_delay_s", 0.0))
-    # v1.4: do not leave a dynamic quadruped uncontrolled for a fixed 14 s.
-    # The bootstrap process already waits for /controller_manager/list_controllers,
-    # so starting the waiter immediately is both safer and still race tolerant.
+    controller_pose_recovery_s = max(0.0, _float_arg(context, "controller_pose_recovery_s", 3.0))
+    controller_pose_recovery_period_s = max(0.05, _float_arg(context, "controller_pose_recovery_period_s", 0.25))
+    controller_pose_recovery_z_offset_m = _float_arg(context, "controller_pose_recovery_z_offset_m", 0.0)
+
+    # v1.5: the model can tip before the effort controller becomes active.  The
+    # service-driven bootstrap still starts immediately, but once both controllers
+    # are active we restore the model to its requested spawn pose for a short,
+    # deterministic stabilization window.  This happens entirely before the
+    # experiment readiness gate and does not consume scientific episode time.
+    world_path = LaunchConfiguration("world").perform(context)
+    try:
+        world_root = ET.parse(world_path).getroot()
+        world_el = world_root.find("world")
+        world_name = world_el.get("name") if world_el is not None else "default"
+    except Exception:
+        world_name = "default"
+
+    recovery_count = max(1, int(math.ceil(controller_pose_recovery_s / controller_pose_recovery_period_s)))
+    qz = math.sin(0.5 * heading)
+    qw = math.cos(0.5 * heading)
 
     unitree_go2_sim_share = get_package_share_directory("unitree_go2_sim")
 
@@ -375,6 +394,10 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
         controller_bootstrap_cmd = (
             'set -euo pipefail; '
             f"CM='{cm}'; NS='{ns}'; PARAM_FILE='{ros_control_yaml}'; "
+            f"WORLD='{world_name}'; MODEL='{robot_name}'; "
+            f"PX='{x:.9f}'; PY='{y:.9f}'; PZ='{(z0 + controller_pose_recovery_z_offset_m):.9f}'; "
+            f"QZ='{qz:.12f}'; QW='{qw:.12f}'; "
+            f"RECOVERY_COUNT='{recovery_count}'; RECOVERY_PERIOD='{controller_pose_recovery_period_s:.6f}'; "
             'echo "[$NS] waiting for $CM/list_controllers ..."; '
             'ready=0; '
             'for k in $(seq 1 1800); do '
@@ -417,7 +440,22 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
             'ensure_active joint_group_effort_controller; '
             'echo "[$NS] controller status after bootstrap:"; '
             'ros2 control list_controllers -c "$CM"; '
-            'echo "[$NS] controller bootstrap complete"'
+            'reset_pose() { '
+            '  gz service -s "/world/$WORLD/set_pose" '
+            '    --reqtype gz.msgs.Pose --reptype gz.msgs.Boolean --timeout 2000 '
+            '    --req "name: \"$MODEL\", position: {x: $PX, y: $PY, z: $PZ}, orientation: {x: 0.0, y: 0.0, z: $QZ, w: $QW}" '
+            '    >/dev/null 2>&1; '
+            '}; '
+            'echo "[$NS] post-controller upright recovery: model=$MODEL world=$WORLD samples=$RECOVERY_COUNT period=${RECOVERY_PERIOD}s"; '
+            'RECOVERY_OK=0; '
+            'for k in $(seq 1 "$RECOVERY_COUNT"); do '
+            '  if reset_pose; then RECOVERY_OK=1; fi; '
+            '  sleep "$RECOVERY_PERIOD"; '
+            'done; '
+            'if [ "$RECOVERY_OK" -ne 1 ]; then '
+            '  echo "[$NS] ERROR: Gazebo set_pose recovery service failed for /world/$WORLD/set_pose" >&2; exit 24; '
+            'fi; '
+            'echo "[$NS] controller bootstrap + upright recovery complete"'
         )
 
         controller_bootstrap = TimerAction(
@@ -528,6 +566,24 @@ def generate_launch_description() -> LaunchDescription:
         description="Start service-driven controller bootstrap immediately; it waits for the controller-manager service itself.",
     )
 
+    declare_controller_pose_recovery_s = DeclareLaunchArgument(
+        "controller_pose_recovery_s",
+        default_value="3.0",
+        description="Wall-clock duration after controller activation during which the Gazebo model pose is restored to the requested upright spawn pose.",
+    )
+
+    declare_controller_pose_recovery_period = DeclareLaunchArgument(
+        "controller_pose_recovery_period_s",
+        default_value="0.25",
+        description="Wall-clock interval between startup upright-pose recovery commands.",
+    )
+
+    declare_controller_pose_recovery_z_offset = DeclareLaunchArgument(
+        "controller_pose_recovery_z_offset_m",
+        default_value="0.0",
+        description="Optional Z offset added to world_init_z only during post-controller startup pose recovery.",
+    )
+
     declare_world_init_x = DeclareLaunchArgument("world_init_x", default_value="0.0")
     declare_world_init_y = DeclareLaunchArgument("world_init_y", default_value="0.0")
     declare_world_init_z = DeclareLaunchArgument("world_init_z", default_value="0.375")
@@ -607,6 +663,9 @@ def generate_launch_description() -> LaunchDescription:
             declare_robot_spawn_start_delay,
             declare_robot_start_stagger,
             declare_controller_bootstrap_delay,
+            declare_controller_pose_recovery_s,
+            declare_controller_pose_recovery_period,
+            declare_controller_pose_recovery_z_offset,
             declare_world_init_x,
             declare_world_init_y,
             declare_world_init_z,
