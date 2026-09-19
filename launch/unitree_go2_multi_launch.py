@@ -1,8 +1,6 @@
-import math
 import os
 import subprocess
 import tempfile
-import xml.etree.ElementTree as ET
 from typing import List
 
 import launch_ros
@@ -67,26 +65,9 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
     spawn_start_delay_s = max(0.0, _float_arg(context, "robot_spawn_start_delay_s", 6.0))
     robot_start_stagger_s = max(0.0, _float_arg(context, "robot_start_stagger_s", 12.0))
     controller_bootstrap_delay_s = max(0.0, _float_arg(context, "controller_bootstrap_delay_s", 0.0))
-    controller_pose_recovery_s = max(0.0, _float_arg(context, "controller_pose_recovery_s", 3.0))
-    controller_pose_recovery_period_s = max(0.05, _float_arg(context, "controller_pose_recovery_period_s", 0.25))
-    controller_pose_recovery_z_offset_m = _float_arg(context, "controller_pose_recovery_z_offset_m", 0.0)
-
-    # v1.5: the model can tip before the effort controller becomes active.  The
-    # service-driven bootstrap still starts immediately, but once both controllers
-    # are active we restore the model to its requested spawn pose for a short,
-    # deterministic stabilization window.  This happens entirely before the
-    # experiment readiness gate and does not consume scientific episode time.
-    world_path = LaunchConfiguration("world").perform(context)
-    try:
-        world_root = ET.parse(world_path).getroot()
-        world_el = world_root.find("world")
-        world_name = world_el.get("name") if world_el is not None else "default"
-    except Exception:
-        world_name = "default"
-
-    recovery_count = max(1, int(math.ceil(controller_pose_recovery_s / controller_pose_recovery_period_s)))
-    qz = math.sin(0.5 * heading)
-    qw = math.cos(0.5 * heading)
+    # v1.4: do not leave a dynamic quadruped uncontrolled for a fixed 14 s.
+    # The bootstrap process already waits for /controller_manager/list_controllers,
+    # so starting the waiter immediately is both safer and still race tolerant.
 
     unitree_go2_sim_share = get_package_share_directory("unitree_go2_sim")
 
@@ -394,10 +375,6 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
         controller_bootstrap_cmd = (
             'set -euo pipefail; '
             f"CM='{cm}'; NS='{ns}'; PARAM_FILE='{ros_control_yaml}'; "
-            f"WORLD='{world_name}'; MODEL='{robot_name}'; "
-            f"PX='{x:.9f}'; PY='{y:.9f}'; PZ='{(z0 + controller_pose_recovery_z_offset_m):.9f}'; "
-            f"QZ='{qz:.12f}'; QW='{qw:.12f}'; "
-            f"RECOVERY_COUNT='{recovery_count}'; RECOVERY_PERIOD='{controller_pose_recovery_period_s:.6f}'; "
             'echo "[$NS] waiting for $CM/list_controllers ..."; '
             'ready=0; '
             'for k in $(seq 1 1800); do '
@@ -409,53 +386,89 @@ def _spawn_robots(context, *args, **kwargs) -> List[object]:
             'fi; '
             'echo "[$NS] controller manager is available"; '
             'exec 9>/tmp/unitree_go2_controller_bootstrap.lock; '
-            'if ! flock -w 180 9; then echo "[$NS] ERROR: controller bootstrap lock timeout" >&2; exit 22; fi; '
+            'if ! flock -w 240 9; then echo "[$NS] ERROR: controller bootstrap lock timeout" >&2; exit 22; fi; '
             'echo "[$NS] acquired controller bootstrap lock"; '
-            'ros2 param set "$CM" joint_states_controller.type joint_state_broadcaster/JointStateBroadcaster >/dev/null; '
-            'ros2 param set "$CM" joint_group_effort_controller.type joint_trajectory_controller/JointTrajectoryController >/dev/null; '
-            'ensure_active() { '
+            'ros2 param set "$CM" joint_states_controller.type joint_state_broadcaster/JointStateBroadcaster >/dev/null || true; '
+            'ros2 param set "$CM" joint_group_effort_controller.type joint_trajectory_controller/JointTrajectoryController >/dev/null || true; '
+            # The controller-manager service can exist before gz_ros2_control has
+            # exported the joint interfaces.  Do not attempt controller lifecycle
+            # transitions until those interfaces are observable.
+            'echo "[$NS] waiting for ros2_control hardware interfaces ..."; '
+            'hw_ready=0; '
+            'for k in $(seq 1 1200); do '
+            '  IFACES="$(ros2 control list_hardware_interfaces -c "$CM" 2>/dev/null || true)"; '
+            '  if printf "%s\n" "$IFACES" | grep -q "lf_hip_joint/position" && '
+            '     printf "%s\n" "$IFACES" | grep -q "lf_hip_joint/effort"; then '
+            '    hw_ready=1; break; '
+            '  fi; '
+            '  sleep 0.1; '
+            'done; '
+            'if [ "$hw_ready" -ne 1 ]; then '
+            '  echo "[$NS] ERROR: hardware interfaces never became ready" >&2; '
+            '  ros2 control list_hardware_components -c "$CM" >&2 || true; '
+            '  ros2 control list_hardware_interfaces -c "$CM" >&2 || true; '
+            '  exit 24; '
+            'fi; '
+            'echo "[$NS] ros2_control hardware interfaces are ready"; '
+            'controller_state() { '
             '  NAME="$1"; '
             '  STATUS="$(ros2 control list_controllers -c "$CM" 2>/dev/null || true)"; '
             '  LINE="$(printf "%s\n" "$STATUS" | grep -E "^${NAME}(\\[|[[:space:]])" | head -n1 || true)"; '
-            '  if [ -n "$LINE" ]; then STATE="${LINE##* }"; else STATE=""; fi; '
-            '  if [ "$STATE" = "active" ]; then '
-            '    echo "[$NS] $NAME already active; no bootstrap action needed"; return 0; '
-            '  fi; '
-            '  if [ -z "$STATE" ]; then '
-            '    echo "[$NS] loading and activating $NAME"; '
-            '    ros2 control load_controller "$NAME" "$PARAM_FILE" --set-state active -c "$CM"; '
-            '  else '
-            '    echo "[$NS] $NAME already loaded in state=$STATE; activating idempotently"; '
-            '    ros2 control set_controller_state "$NAME" active -c "$CM"; '
-            '  fi; '
-            '  STATUS="$(ros2 control list_controllers -c "$CM" 2>/dev/null || true)"; '
-            '  LINE="$(printf "%s\n" "$STATUS" | grep -E "^${NAME}(\\[|[[:space:]])" | head -n1 || true)"; '
-            '  if [ -n "$LINE" ]; then STATE="${LINE##* }"; else STATE=""; fi; '
-            '  if [ "$STATE" != "active" ]; then '
-            '    echo "[$NS] ERROR: $NAME state after bootstrap is ${STATE:-missing}" >&2; '
-            '    printf "%s\n" "$STATUS" >&2; return 23; '
-            '  fi; '
+            '  if [ -n "$LINE" ]; then printf "%s" "${LINE##* }"; fi; '
+            '}; '
+            'ensure_active() { '
+            '  NAME="$1"; '
+            '  for ATTEMPT in $(seq 1 120); do '
+            '    STATE="$(controller_state "$NAME")"; '
+            '    if [ "$STATE" = "active" ]; then '
+            '      echo "[$NS] $NAME already active; no bootstrap action needed (attempt $ATTEMPT)"; return 0; '
+            '    fi; '
+            '    case "$STATE" in '
+            '      "") '
+            '        echo "[$NS] $NAME missing; loading unconfigured (attempt $ATTEMPT)"; '
+            '        ros2 control load_controller "$NAME" "$PARAM_FILE" -c "$CM" >/dev/null 2>&1 || true; '
+            '        ;; '
+            '      unconfigured) '
+            # Important: activation is not a valid direct transition from
+            # unconfigured.  First configure to inactive, then activate on the
+            # next iteration.  This is the v1.5 fix for controllers stuck forever
+            # in state=unconfigured.
+            '        echo "[$NS] $NAME unconfigured; configuring -> inactive (attempt $ATTEMPT)"; '
+            '        ros2 control set_controller_state "$NAME" inactive -c "$CM" >/dev/null 2>&1 || true; '
+            '        ;; '
+            '      inactive) '
+            '        echo "[$NS] $NAME inactive; activating (attempt $ATTEMPT)"; '
+            '        ros2 control set_controller_state "$NAME" active -c "$CM" >/dev/null 2>&1 || true; '
+            '        ;; '
+            '      finalized) '
+            '        echo "[$NS] $NAME finalized; unloading for clean retry (attempt $ATTEMPT)"; '
+            '        ros2 control unload_controller "$NAME" -c "$CM" >/dev/null 2>&1 || true; '
+            '        ;; '
+            '      *) '
+            '        echo "[$NS] $NAME unexpected state=${STATE:-missing}; retrying (attempt $ATTEMPT)"; '
+            '        ;; '
+            '    esac; '
+            '    sleep 0.5; '
+            '  done; '
+            '  echo "[$NS] ERROR: $NAME did not become active after lifecycle retry loop" >&2; '
+            '  ros2 control list_controllers -c "$CM" >&2 || true; '
+            '  ros2 control list_hardware_components -c "$CM" >&2 || true; '
+            '  ros2 control list_hardware_interfaces -c "$CM" >&2 || true; '
+            '  return 23; '
             '}; '
             'ensure_active joint_states_controller; '
             'ensure_active joint_group_effort_controller; '
+            'echo "[$NS] verifying controller set is continuously active ..."; '
+            'for K in $(seq 1 8); do '
+            '  S1="$(controller_state joint_states_controller)"; '
+            '  S2="$(controller_state joint_group_effort_controller)"; '
+            '  [ "$S1" = "active" ] || { echo "[$NS] joint_states_controller lost active state: $S1" >&2; exit 25; }; '
+            '  [ "$S2" = "active" ] || { echo "[$NS] joint_group_effort_controller lost active state: $S2" >&2; exit 26; }; '
+            '  sleep 0.25; '
+            'done; '
             'echo "[$NS] controller status after bootstrap:"; '
             'ros2 control list_controllers -c "$CM"; '
-            'reset_pose() { '
-            '  gz service -s "/world/$WORLD/set_pose" '
-            '    --reqtype gz.msgs.Pose --reptype gz.msgs.Boolean --timeout 2000 '
-            '    --req "name: \"$MODEL\", position: {x: $PX, y: $PY, z: $PZ}, orientation: {x: 0.0, y: 0.0, z: $QZ, w: $QW}" '
-            '    >/dev/null 2>&1; '
-            '}; '
-            'echo "[$NS] post-controller upright recovery: model=$MODEL world=$WORLD samples=$RECOVERY_COUNT period=${RECOVERY_PERIOD}s"; '
-            'RECOVERY_OK=0; '
-            'for k in $(seq 1 "$RECOVERY_COUNT"); do '
-            '  if reset_pose; then RECOVERY_OK=1; fi; '
-            '  sleep "$RECOVERY_PERIOD"; '
-            'done; '
-            'if [ "$RECOVERY_OK" -ne 1 ]; then '
-            '  echo "[$NS] ERROR: Gazebo set_pose recovery service failed for /world/$WORLD/set_pose" >&2; exit 24; '
-            'fi; '
-            'echo "[$NS] controller bootstrap + upright recovery complete"'
+            'echo "[$NS] controller bootstrap complete (stable active state)"'
         )
 
         controller_bootstrap = TimerAction(
@@ -566,24 +579,6 @@ def generate_launch_description() -> LaunchDescription:
         description="Start service-driven controller bootstrap immediately; it waits for the controller-manager service itself.",
     )
 
-    declare_controller_pose_recovery_s = DeclareLaunchArgument(
-        "controller_pose_recovery_s",
-        default_value="3.0",
-        description="Wall-clock duration after controller activation during which the Gazebo model pose is restored to the requested upright spawn pose.",
-    )
-
-    declare_controller_pose_recovery_period = DeclareLaunchArgument(
-        "controller_pose_recovery_period_s",
-        default_value="0.25",
-        description="Wall-clock interval between startup upright-pose recovery commands.",
-    )
-
-    declare_controller_pose_recovery_z_offset = DeclareLaunchArgument(
-        "controller_pose_recovery_z_offset_m",
-        default_value="0.0",
-        description="Optional Z offset added to world_init_z only during post-controller startup pose recovery.",
-    )
-
     declare_world_init_x = DeclareLaunchArgument("world_init_x", default_value="0.0")
     declare_world_init_y = DeclareLaunchArgument("world_init_y", default_value="0.0")
     declare_world_init_z = DeclareLaunchArgument("world_init_z", default_value="0.375")
@@ -663,9 +658,6 @@ def generate_launch_description() -> LaunchDescription:
             declare_robot_spawn_start_delay,
             declare_robot_start_stagger,
             declare_controller_bootstrap_delay,
-            declare_controller_pose_recovery_s,
-            declare_controller_pose_recovery_period,
-            declare_controller_pose_recovery_z_offset,
             declare_world_init_x,
             declare_world_init_y,
             declare_world_init_z,
